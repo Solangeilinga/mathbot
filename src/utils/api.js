@@ -1,6 +1,6 @@
 // src/utils/api.js
 
-const BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
+const BASE_URL = import.meta.env.VITE_API_URL || "https://crusher-ambition-drone.ngrok-free.dev/api";
 
 async function apiFetch(endpoint, options = {}) {
   // Plus de token JWT — pas d'auth
