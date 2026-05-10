@@ -98,7 +98,7 @@ const PORT = process.env.PORT || 4000;
       new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout initDB (30s)")), 30000))
     ]);
     const server = app.listen(PORT, () => {
-      console.log(`\n🦉 BEPCMath AI — Serveur démarré`);
+      console.log(`\n🦉 MathBot — Serveur démarré`);
       console.log(`   ➜  http://localhost:${PORT}`);
       console.log(`   ➜  Frontend : ${frontendUrl}`);
       console.log(`   ➜  Environnement : ${isDev ? "DÉVELOPPEMENT" : "PRODUCTION"}\n`);

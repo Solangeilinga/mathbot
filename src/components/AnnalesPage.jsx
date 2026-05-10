@@ -29,7 +29,7 @@ export default function AnnalesPage({ onStartExam, showToast, chapitres }) {
           );
         })}
         <div className="annales-banner">
-          <div><div className="annales-banner-title">Mode Examen Blanc</div><div className="annales-banner-sub">3h chrono · Conditions réelles BEPC</div></div>
+          <div><div className="annales-banner-title">Mode Examen Blanc</div><div className="annales-banner-sub">2h chrono · Conditions réelles BEPC</div></div>
           <button className="annales-exam-btn" onClick={() => { onStartExam("Algèbre"); showToast("Mode Examen Blanc lancé !"); }}>🎓 Lancer l'examen</button>
         </div>
       </div>
