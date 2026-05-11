@@ -5,9 +5,9 @@ const EXAM_DURATION = 2 * 60 * 60;
 
 // ── Parser robuste a/b/c/d et A/B/C/D ────────────────────────────────────────
 function parseSujet(sujetText) {
-  const lines = sujetText.split("\n").map(l => l.trim());
+  const lines     = sujetText.split("\n").map(l => l.trim());
   const questions = [];
-  let current = null;
+  let current     = null;
 
   const optReg  = /^([a-dA-D])[.)]\s+(.+)/;
   const qNumReg = /^(\d+\.\d+)\)\s*(.*)/;
@@ -18,8 +18,8 @@ function parseSujet(sujetText) {
     const optMatch = line.match(optReg);
     if (optMatch && current) {
       current.options.push({
-        letter: optMatch[1].toUpperCase(),
-        text:   optMatch[2].trim(),
+        letter:  optMatch[1].toUpperCase(),
+        text:    optMatch[2].trim(),
         correct: false,
       });
       continue;
@@ -29,22 +29,23 @@ function parseSujet(sujetText) {
     if (qMatch) {
       if (current && current.options.length >= 2) questions.push(current);
       const qText = qMatch[2].trim();
-      if (qText.length > 3) {
-        current = { id: questions.length + 1, numStr: qMatch[1], text: qText, options: [] };
-      } else {
-        current = { id: questions.length + 1, numStr: qMatch[1], text: "", options: [], pendingText: true };
-      }
+      current = {
+        id:      questions.length + 1,
+        numStr:  qMatch[1],
+        text:    qText,
+        options: [],
+        pendingText: qText.length <= 3,
+      };
       continue;
     }
 
-    if (current && current.pendingText && !optReg.test(line) && line.length > 5) {
-      current.text += (current.text ? " " : "") + line;
+    if (current?.pendingText && !optReg.test(line) && line.length > 5) {
+      current.text       += (current.text ? " " : "") + line;
       current.pendingText = false;
     }
   }
   if (current && current.options.length >= 2) questions.push(current);
 
-  // Filtre les questions sans texte
   return questions.filter(q => q.text.length > 3);
 }
 
@@ -53,9 +54,10 @@ const fmt = s => {
   return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
 };
 
-export default function ExamSimulationPage({ chapter, onExit, showToast, user }) {
+export default function ExamSimulationPage({ chapter, onExit, showToast }) {
   const [timeLeft, setTimeLeft]   = useState(EXAM_DURATION);
   const [loading, setLoading]     = useState(true);
+  const [error, setError]         = useState(null);
   const [subject, setSubject]     = useState(null);
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers]     = useState({});
@@ -68,21 +70,44 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
   const timerRef  = useRef(null);
   const submitted = useRef(false);
 
+  // Charge le sujet — utilise "Mixte" si chapter = "Mixte", sinon session générique
   useEffect(() => {
     (async () => {
       try {
-        const data = await subjectAPI.getSubject("2025", "Mixte");
+        setLoading(true);
+        setError(null);
+
+        // Essai 1 : sujet correspondant au chapitre exact
+        let data = null;
+        try {
+          data = await subjectAPI.getSubject("2025", chapter === "Mixte" ? "Mixte" : chapter);
+        } catch {
+          // Essai 2 : sujet Mixte par défaut
+          try {
+            data = await subjectAPI.getSubject("2025", "Mixte");
+          } catch {
+            throw new Error("Aucun sujet disponible. Lance d'abord le script insertTestSubject.js");
+          }
+        }
+
         setSubject(data);
         setQuestions(parseSujet(data.sujet));
-      } catch (err) { showToast(`❌ ${err.message}`); onExit(); }
-      finally { setLoading(false); }
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
     })();
-  }, []); // eslint-disable-line
+  }, [chapter]);
 
+  // Timer
   useEffect(() => {
     if (!subject || phase !== "exam") return;
     timerRef.current = setInterval(() => {
-      setTimeLeft(p => { if (p <= 1) { clearInterval(timerRef.current); doSubmit(); return 0; } return p - 1; });
+      setTimeLeft(p => {
+        if (p <= 1) { clearInterval(timerRef.current); doSubmit(); return 0; }
+        return p - 1;
+      });
     }, 1000);
     return () => clearInterval(timerRef.current);
   }, [subject, phase]); // eslint-disable-line
@@ -96,13 +121,12 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
       const detail = questions.map(q => ({
         q,
         userLetter: answers[q.id] || null,
-        skipped: !answers[q.id],
+        skipped:    !answers[q.id],
       }));
       const answered = detail.filter(d => !d.skipped).length;
       setResults({ detail, answered, total: questions.length });
       setPhase("results");
 
-      // Correction IA sur les réponses
       if (subject && answered > 0) {
         setAiCorrecting(true);
         const synthAnswers = detail.map(d => {
@@ -118,12 +142,12 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
         finally { setAiCorrecting(false); }
       }
 
-    } else if (freeText.trim()) {
+    } else if (freeText.trim() && subject) {
       setPhase("results");
-      setResults({ freeText: true });
+      setResults({ freeText: true, answered: 1, total: 1 });
       setAiCorrecting(true);
       try {
-        const r = await subjectAPI.correctSubject(subject?.sujet || "", freeText);
+        const r = await subjectAPI.correctSubject(subject.sujet, freeText);
         setAiNote(r);
         await examAPI.logResults(chapter, r.note, 20, timeLeft);
       } catch { showToast("❌ Erreur correction IA"); }
@@ -138,8 +162,31 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
     setAnswers(p => ({ ...p, [qId]: letter }));
   }, []);
 
-  if (loading) return <div className="exam-loading"><div className="loading-spinner">⏳</div><p>Chargement du sujet…</p></div>;
-  if (!subject) return <div className="exam-error"><p>❌ Sujet introuvable</p><button className="btn-secondary" onClick={onExit}>Retour</button></div>;
+  // ── États d'affichage ─────────────────────────────────────────────────────
+
+  if (loading) return (
+    <div className="exam-loading">
+      <div className="loading-spinner">⏳</div>
+      <p>Chargement du sujet BEPC…</p>
+    </div>
+  );
+
+  if (error) return (
+    <div className="exam-error">
+      <p>❌ {error}</p>
+      <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 16 }}>
+        Assure-toi d'avoir lancé : <code>node scripts/insertTestSubject.js</code>
+      </p>
+      <button className="btn-secondary" onClick={onExit}>← Retour</button>
+    </div>
+  );
+
+  if (!subject) return (
+    <div className="exam-error">
+      <p>❌ Sujet introuvable</p>
+      <button className="btn-secondary" onClick={onExit}>← Retour</button>
+    </div>
+  );
 
   if (phase === "results") {
     return (
@@ -157,8 +204,8 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
     );
   }
 
-  const totalQ = questions.length;
-  const answered = Object.keys(answers).length;
+  const totalQ    = questions.length;
+  const answered  = Object.keys(answers).length;
   const timerColor = timeLeft < 600 ? "#ef4444" : timeLeft < 1800 ? "#f97316" : "#22c55e";
 
   return (
@@ -171,18 +218,20 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
         </div>
         <div style={{ textAlign: "right" }}>
           <div className="exam-timer" style={{ color: timerColor }}>{fmt(timeLeft)}</div>
-          <div className="exam-timer-bar"><div className="exam-timer-fill" style={{ width: `${timeLeft / EXAM_DURATION * 100}%`, background: timerColor }} /></div>
+          <div className="exam-timer-bar">
+            <div className="exam-timer-fill" style={{ width: `${timeLeft / EXAM_DURATION * 100}%`, background: timerColor }} />
+          </div>
         </div>
       </div>
 
-      {/* Progress */}
+      {/* Barre progression */}
       <div className="exam-progress-bar">
         <div className="exam-progress-fill" style={{ width: `${totalQ > 0 ? answered / totalQ * 100 : 0}%` }} />
       </div>
 
       {questions.length > 0 ? (
         <div className="exam-body">
-          {/* Nav latérale */}
+          {/* Nav questions */}
           <div className="exam-nav-panel">
             <div className="exam-nav-title">Questions</div>
             <div className="exam-nav-grid">
@@ -200,7 +249,7 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
             </div>
           </div>
 
-          {/* Question */}
+          {/* Question active */}
           <div className="exam-question-panel">
             {questions[currentQ] && (
               <QuestionCard
@@ -216,26 +265,42 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
           </div>
         </div>
       ) : (
+        /* Fallback texte libre */
         <div className="exam-freetext-body">
           <div className="exam-freetext-subject">
             <h3>Sujet</h3>
             <div className="subject-scroll">
-              {subject.sujet.split("\n").map((l, i) => <div key={i} className="subject-line">{l || "\u00A0"}</div>)}
+              {subject.sujet.split("\n").map((l, i) => (
+                <div key={i} className="subject-line">{l || "\u00A0"}</div>
+              ))}
             </div>
           </div>
           <div className="exam-freetext-answer">
             <h3>Vos réponses</h3>
-            <textarea className="answer-textarea" value={freeText} onChange={e => setFreeText(e.target.value)} placeholder="Rédigez vos réponses ici…" />
+            <textarea
+              className="answer-textarea"
+              value={freeText}
+              onChange={e => setFreeText(e.target.value)}
+              placeholder="Rédigez vos réponses ici…"
+            />
             <p className="answer-count">{freeText.length} caractères</p>
           </div>
         </div>
       )}
 
+      {/* Footer */}
       <div className="exam-footer">
         <button className="btn-secondary" onClick={onExit}>← Annuler</button>
-        <span className="exam-status">{totalQ > 0 && answered < totalQ ? `${totalQ - answered} question(s) restante(s)` : answered === totalQ && totalQ > 0 ? "✅ Tout répondu !" : ""}</span>
-        <button className="btn-finish" onClick={doSubmit}
-          disabled={aiCorrecting || (totalQ > 0 ? answered === 0 : !freeText.trim())}>
+        <span className="exam-status">
+          {totalQ > 0 && answered < totalQ
+            ? `${totalQ - answered} question(s) restante(s)`
+            : answered === totalQ && totalQ > 0 ? "✅ Tout répondu !" : ""}
+        </span>
+        <button
+          className="btn-finish"
+          onClick={doSubmit}
+          disabled={aiCorrecting || (totalQ > 0 ? answered === 0 : !freeText.trim())}
+        >
           ✅ Soumettre
         </button>
       </div>
@@ -243,7 +308,7 @@ export default function ExamSimulationPage({ chapter, onExit, showToast, user })
   );
 }
 
-// ── Question card ─────────────────────────────────────────────────────────────
+// ── Carte de question ─────────────────────────────────────────────────────────
 function QuestionCard({ question, index, total, selected, onSelect, onPrev, onNext }) {
   return (
     <div className="question-card">
@@ -277,28 +342,30 @@ function QuestionCard({ question, index, total, selected, onSelect, onPrev, onNe
   );
 }
 
-// ── Page résultats — claire et visuelle ───────────────────────────────────────
+// ── Résultats ─────────────────────────────────────────────────────────────────
 function ResultsPage({ results, aiNote, aiCorrecting, onRetry, onExit }) {
-  const pct = aiNote?.percentage ?? null;
+  const pct  = aiNote?.percentage ?? null;
   const note = aiNote?.note ?? null;
-  const answered = results?.answered ?? 0;
-  const total = results?.total ?? 0;
-  const skipped = total - answered;
 
-  const grade = pct === null ? null : pct >= 80 ? "A" : pct >= 70 ? "B" : pct >= 60 ? "C" : pct >= 50 ? "D" : "E";
-  const gradeColor = !grade ? "var(--text-muted)"
-    : grade === "A" ? "#22c55e"
-    : grade === "B" ? "#4ade80"
-    : grade === "C" ? "#f97316"
-    : grade === "D" ? "#fb923c"
+  const gradeColor = pct === null ? "var(--text-muted)"
+    : pct >= 80 ? "#22c55e"
+    : pct >= 70 ? "#4ade80"
+    : pct >= 60 ? "#f97316"
+    : pct >= 50 ? "#fb923c"
     : "#ef4444";
-  const verdict = !grade ? "" : grade === "A" ? "Excellent ! 🎉" : grade === "B" ? "Très bien 👍" : grade === "C" ? "Assez bien" : grade === "D" ? "Peut mieux faire" : "À retravailler 💪";
+
+  const verdict = pct === null ? ""
+    : pct >= 80 ? "Excellent ! 🎉"
+    : pct >= 70 ? "Très bien 👍"
+    : pct >= 60 ? "Assez bien"
+    : pct >= 50 ? "Peut mieux faire"
+    : "À retravailler 💪";
 
   return (
     <div className="results-page">
       <div className="results-inner">
 
-        {/* ── Score principal ── */}
+        {/* Score */}
         <div className="results-score-card">
           <div className="rsc-left">
             {aiCorrecting ? (
@@ -310,27 +377,25 @@ function ResultsPage({ results, aiNote, aiCorrecting, onRetry, onExit }) {
               <div className="rsc-grade">
                 <div className="rsc-note" style={{ color: gradeColor }}>{note}<span className="rsc-denom">/20</span></div>
                 <div className="rsc-pct" style={{ color: gradeColor }}>{pct}%</div>
-                <div className="rsc-letter" style={{ background: gradeColor + "22", color: gradeColor }}>Mention {grade}</div>
               </div>
             ) : (
               <div className="rsc-grade">
                 <div className="rsc-note" style={{ color: "var(--text-muted)" }}>–</div>
-                <p style={{ fontSize: 12, color: "var(--text-muted)" }}>En attente de correction</p>
               </div>
             )}
           </div>
           <div className="rsc-right">
             {verdict && <div className="rsc-verdict">{verdict}</div>}
             <div className="rsc-stats">
-              <div className="rsc-stat"><span className="rsc-stat-num">{total}</span><span className="rsc-stat-lbl">Questions</span></div>
-              <div className="rsc-stat"><span className="rsc-stat-num green">{answered}</span><span className="rsc-stat-lbl">Répondues</span></div>
-              <div className="rsc-stat"><span className="rsc-stat-num muted">{skipped}</span><span className="rsc-stat-lbl">Ignorées</span></div>
+              <div className="rsc-stat"><span className="rsc-stat-num">{results?.total || 0}</span><span className="rsc-stat-lbl">Questions</span></div>
+              <div className="rsc-stat"><span className="rsc-stat-num green">{results?.answered || 0}</span><span className="rsc-stat-lbl">Répondues</span></div>
+              <div className="rsc-stat"><span className="rsc-stat-num muted">{(results?.total || 0) - (results?.answered || 0)}</span><span className="rsc-stat-lbl">Ignorées</span></div>
             </div>
           </div>
         </div>
 
-        {/* ── Récapitulatif des réponses ── */}
-        {results?.detail && results.detail.length > 0 && (
+        {/* Récap réponses */}
+        {results?.detail && (
           <div className="results-section">
             <h3 className="results-section-title">📋 Tes réponses</h3>
             <div className="answers-recap-grid">
@@ -355,7 +420,7 @@ function ResultsPage({ results, aiNote, aiCorrecting, onRetry, onExit }) {
           </div>
         )}
 
-        {/* ── Correction IA ── */}
+        {/* Correction IA */}
         {aiCorrecting && (
           <div className="results-section">
             <h3 className="results-section-title">🦉 Correction de MathBot</h3>
@@ -373,20 +438,16 @@ function ResultsPage({ results, aiNote, aiCorrecting, onRetry, onExit }) {
             <h3 className="results-section-title">🦉 Correction de MathBot</h3>
             <div className="ai-correction-card">
               {aiNote.correction.split("\n").filter(Boolean).map((line, i) => {
-                // Détecte les lignes-titres (commencent par chiffre ou lettre majuscule + ".")
                 const isTitle = /^[\d]+[.)]\s+[A-ZÀÉÈÊ]/.test(line) || /^[A-ZÀÉÈÊ][^a-z]{0,3}:/.test(line);
-                return isTitle
-                  ? <div key={i} className="ai-line title">{line}</div>
-                  : <div key={i} className="ai-line">{line}</div>;
+                return <div key={i} className={`ai-line ${isTitle ? "title" : ""}`}>{line}</div>;
               })}
             </div>
           </div>
         )}
 
-        {/* ── Actions ── */}
         <div className="results-actions">
           <button className="btn-retry" onClick={onRetry}>🔄 Recommencer</button>
-          <button className="btn-back" onClick={onExit}>← Retour aux annales</button>
+          <button className="btn-back"  onClick={onExit}>← Retour aux annales</button>
         </div>
       </div>
     </div>

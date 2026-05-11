@@ -3,16 +3,34 @@
 const BASE_URL = import.meta.env.VITE_API_URL || "https://crusher-ambition-drone.ngrok-free.dev/api";
 
 async function apiFetch(endpoint, options = {}) {
-  // Plus de token JWT — pas d'auth
   const headers = {
     "Content-Type": "application/json",
+    // Header obligatoire pour ngrok — évite la page d'interstitiel HTML
+    "ngrok-skip-browser-warning": "true",
     ...options.headers,
   };
-  const response = await fetch(`${BASE_URL}${endpoint}`, { ...options, headers });
+
+  let response;
+  try {
+    response = await fetch(`${BASE_URL}${endpoint}`, { ...options, headers });
+  } catch (networkErr) {
+    throw new Error(`Erreur réseau : ${networkErr.message}`);
+  }
+
+  // Vérifie que la réponse est bien du JSON (pas une page HTML ngrok)
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await response.text();
+    console.error(`[api] Réponse non-JSON sur ${endpoint}:`, text.slice(0, 200));
+    throw new Error(`Réponse inattendue du serveur (pas du JSON). Vérifie ngrok ou l'URL.`);
+  }
+
   const data = await response.json();
+
   if (!response.ok) {
     throw new Error(data.error || `Erreur ${response.status}`);
   }
+
   return data;
 }
 
@@ -64,9 +82,19 @@ export const examAPI = {
 // ─── Sujets d'examen ──────────────────────────────────────────────────────────
 export const subjectAPI = {
   getSessions: () => apiFetch("/subject/sessions"),
-  getSubjectsBySession: (session) => apiFetch(`/subject/${encodeURIComponent(session)}`),
+  getSubjectsBySession: (session) =>
+    apiFetch(`/subject/${encodeURIComponent(session)}`),
   getSubject: (session, chapitre) =>
     apiFetch(`/subject/${encodeURIComponent(session)}/${encodeURIComponent(chapitre)}`),
   correctSubject: (sujet, reponses) =>
     apiFetch("/subject/correct", { method: "POST", body: JSON.stringify({ sujet, reponses }) }),
+};
+
+// ─── Analyse d'exercice ───────────────────────────────────────────────────────
+export const exerciseAPI = {
+  analyze: ({ imageBase64, imageType, exerciseText, chapitre }) =>
+    apiFetch("/exercise/analyze", {
+      method: "POST",
+      body: JSON.stringify({ imageBase64, imageType, exerciseText, chapitre }),
+    }),
 };

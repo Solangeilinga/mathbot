@@ -12,70 +12,23 @@ const QUICK_ACTIONS = [
   { label: "🔁 Revoir les bases", text: "Je veux revoir les bases du chapitre depuis le début, étape par étape" },
 ];
 
-// ── TTS : Gemini si dispo, sinon Web Speech API du navigateur ─────────────────
-async function speakText(text, { onStart, onEnd, onError } = {}) {
-  // 1. Essai Gemini TTS via backend
+function playAudioBase64(base64, mimeType, { onStart, onEnd } = {}) {
   try {
-    const data = await ttsAPI.synthesize(text);
-
-    if (data.audioContent) {
-      // Gemini a retourné de l'audio base64
-      const bytes = atob(data.audioContent);
-      const buf = new Uint8Array(bytes.length);
-      for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
-      const blob = new Blob([buf], { type: data.mimeType || "audio/wav" });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.onplay = onStart;
-      audio.onended = () => { URL.revokeObjectURL(url); onEnd?.(); };
-      audio.onerror = () => { URL.revokeObjectURL(url); speakBrowser(data.cleanText || text, { onStart, onEnd, onError }); };
-      audio.play();
-      return { type: "gemini", audio };
-    }
-
-    if (data.fallback) {
-      // Backend signale d'utiliser le navigateur (Groq = pas de TTS)
-      return speakBrowser(data.cleanText || text, { onStart, onEnd, onError });
-    }
+    const bytes = atob(base64);
+    const buf   = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
+    const blob  = new Blob([buf], { type: mimeType || "audio/mpeg" });
+    const url   = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onplay  = onStart;
+    audio.onended = () => { URL.revokeObjectURL(url); onEnd?.(); };
+    audio.onerror = () => { URL.revokeObjectURL(url); onEnd?.(); };
+    audio.play().catch(() => { URL.revokeObjectURL(url); onEnd?.(); });
+    return audio;
   } catch {
-    // Backend inaccessible → navigateur directement
+    onEnd?.();
+    return null;
   }
-
-  return speakBrowser(text, { onStart, onEnd, onError });
-}
-
-function speakBrowser(text, { onStart, onEnd, onError } = {}) {
-  if (!window.speechSynthesis) { onEnd?.(); return null; }
-  window.speechSynthesis.cancel();
-
-  const clean = (text || "")
-    .replace(/[^\p{L}\p{N}\s.,!?;:'«»()\-]/gu, " ")
-    .replace(/\*+|#+/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 700);
-
-  if (!clean) { onEnd?.(); return null; }
-
-  const utt = new SpeechSynthesisUtterance(clean);
-  utt.lang = "fr-FR";
-  utt.rate = 0.9;
-  utt.pitch = 1.05;
-
-  const applyVoice = () => {
-    const voices = window.speechSynthesis.getVoices();
-    const fr = voices.find(v => v.lang === "fr-FR" && v.localService)
-      || voices.find(v => v.lang.startsWith("fr"))
-      || null;
-    if (fr) utt.voice = fr;
-  };
-  window.speechSynthesis.getVoices().length ? applyVoice() : (window.speechSynthesis.onvoiceschanged = applyVoice);
-
-  utt.onstart = onStart;
-  utt.onend   = onEnd;
-  utt.onerror = () => { onError?.(); onEnd?.(); };
-  window.speechSynthesis.speak(utt);
-  return { type: "browser", utt };
 }
 
 export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalkingChange }) {
@@ -83,14 +36,18 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
   const [inputText, setInputText]   = useState("");
   const [isLoading, setIsLoading]   = useState(false);
   const [speakingId, setSpeakingId] = useState(null);
+
   const chatRef        = useRef(null);
   const initializedRef = useRef(false);
-  const currentAudio   = useRef(null); // {type:"gemini"|"browser", audio?}
+  // Ref pour la lecture en cours — jamais périmé dans les callbacks
+  const playing = useRef(null); // { handle: Audio|null, msgId: number } | null
+  // Ref pour setTalking — stable
+  const onTalkingChangeRef = useRef(onTalkingChange);
+  useEffect(() => { onTalkingChangeRef.current = onTalkingChange; }, [onTalkingChange]);
 
-  // Prénom garanti non-undefined
   const prenom = user?.prenom && user.prenom !== "undefined" ? user.prenom : "";
 
-  const setTalking = useCallback(val => { onTalkingChange?.(val); }, [onTalkingChange]);
+  const setTalking = useCallback(val => onTalkingChangeRef.current?.(val), []);
 
   // Scroll auto
   useEffect(() => {
@@ -102,50 +59,107 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
     setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg }])
   , []);
 
-  // Arrête la lecture en cours
-  const stopCurrent = useCallback(() => {
-    if (currentAudio.current?.type === "gemini") currentAudio.current.audio?.pause();
-    window.speechSynthesis?.cancel();
-    currentAudio.current = null;
+  // ── Stop propre ───────────────────────────────────────────────────────────
+  const stopAll = useCallback(() => {
+    if (playing.current?.handle) {
+      try { playing.current.handle.pause(); } catch {}
+    }
+    playing.current = null;
     setSpeakingId(null);
     setTalking(false);
   }, [setTalking]);
 
-  // Lance la lecture d'un message
-  const playMessage = useCallback(async (msgId, text) => {
-    if (speakingId === msgId) { stopCurrent(); return; }
-    stopCurrent();
+  // ── speakMessage — stable grâce aux refs ──────────────────────────────────
+  // On utilise une ref pour la fonction elle-même afin qu'elle soit accessible
+  // depuis callAI sans créer de dépendance circulaire
+  const speakMessageRef = useRef(null);
+
+  speakMessageRef.current = async (msgId, text) => {
+    // Toggle
+    if (playing.current?.msgId === msgId) {
+      stopAll();
+      return;
+    }
+    stopAll();
+
+    // Marque immédiatement
     setSpeakingId(msgId);
     setTalking(true);
-    const handle = await speakText(text, {
-      onStart: () => { setSpeakingId(msgId); setTalking(true); },
-      onEnd:   () => { currentAudio.current = null; setSpeakingId(null); setTalking(false); },
-      onError: () => { currentAudio.current = null; setSpeakingId(null); setTalking(false); },
-    });
-    currentAudio.current = handle;
-  }, [speakingId, stopCurrent, setTalking]);
 
-  // Appel IA
+    try {
+      const data = await ttsAPI.synthesize(text);
+
+      // Vérifie qu'on n'a pas été supplanté
+      // (si playing.current a changé, un autre message a pris le relais)
+      if (playing.current !== null) return;
+
+      const onEnd = () => {
+        // Vérifie que c'est bien ce message qui finit
+        if (playing.current?.msgId === msgId) {
+          playing.current = null;
+          setSpeakingId(null);
+          setTalking(false);
+        }
+      };
+
+      if (data.silent) {
+        // Pas de voix disponible
+        playing.current = null;
+        setSpeakingId(null);
+        setTalking(false);
+        return;
+      }
+
+      if (data.audioContent) {
+        const audio = playAudioBase64(data.audioContent, data.mimeType, {
+          onStart: () => { setSpeakingId(msgId); setTalking(true); },
+          onEnd,
+        });
+        if (audio) {
+          playing.current = { handle: audio, msgId };
+        } else {
+          playing.current = null;
+          setSpeakingId(null);
+          setTalking(false);
+        }
+      } else {
+        playing.current = null;
+        setSpeakingId(null);
+        setTalking(false);
+      }
+    } catch {
+      playing.current = null;
+      setSpeakingId(null);
+      setTalking(false);
+    }
+  };
+
+  // Wrapper stable exposé aux composants
+  const speakMessage = useCallback((msgId, text) => {
+    speakMessageRef.current(msgId, text);
+  }, []);
+
+  // ── Appel IA ──────────────────────────────────────────────────────────────
   const callAI = useCallback(async (text) => {
     setIsLoading(true);
     try {
       const data = await chatAPI.sendMessage(text, chapter);
       setIsLoading(false);
       const msgId = Date.now();
+      // 1. Affiche le texte immédiatement
       appendMessage({ id: msgId, role: "bot", type: "text", content: data.reply });
-      playMessage(msgId, data.reply);
+      // 2. Lance la voix automatiquement
+      speakMessageRef.current(msgId, data.reply);
     } catch (err) {
       setIsLoading(false);
       let msg = "⚠️ MathBot ne peut pas répondre pour le moment";
       if (err.message.includes("429") || err.message.includes("Limite"))
         msg = "⏱️ Limite atteinte — réessaie dans quelques secondes";
-      else if (err.message.includes("401"))
-        msg = "🔐 Session expirée, reconnecte-toi";
       appendMessage({ role: "bot", type: "text", content: msg });
     }
-  }, [chapter, appendMessage, playMessage]);
+  }, [chapter, appendMessage]);
 
-  // Reconnaissance vocale
+  // ── Voix entrée ───────────────────────────────────────────────────────────
   const onVoiceResult = useCallback(transcript => {
     appendMessage({ role: "user", type: "text", content: transcript });
     callAI(transcript);
@@ -158,11 +172,12 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
   const { listening, start: startListening, stop: stopListening, supported: sttSupported } =
     useSpeechRecognition({ onResult: onVoiceResult, onError: onVoiceError });
 
-  // Chargement initial — welcome via API dédiée
+  // ── Bienvenue — s'exécute une seule fois par chapitre ─────────────────────
   useEffect(() => {
     if (initializedRef.current) return;
     initializedRef.current = true;
     setMessages([]);
+
     (async () => {
       setIsLoading(true);
       try {
@@ -170,25 +185,24 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
         setIsLoading(false);
         const msgId = Date.now();
         appendMessage({ id: msgId, role: "bot", type: "text", content: data.reply });
-        playMessage(msgId, data.reply);
+        // Voix auto sur le message de bienvenue
+        speakMessageRef.current(msgId, data.reply);
       } catch {
         setIsLoading(false);
-        const msgId = Date.now();
         const fallback = prenom
-          ? `Bonjour ${prenom} ! Je suis MathBot, ton tuteur de maths. Prêt à travailler "${chapter}" ensemble ? 😊`
-          : `Bonjour ! Je suis MathBot, ton tuteur de maths. Prêt à travailler "${chapter}" ensemble ? 😊`;
-        appendMessage({ id: msgId, role: "bot", type: "text", content: fallback });
+          ? `Bonjour ${prenom} ! Je suis MathBot, prêt à travailler "${chapter}" avec toi 😊`
+          : `Bonjour ! Prêt à travailler "${chapter}" ensemble 😊`;
+        appendMessage({ role: "bot", type: "text", content: fallback });
       }
     })();
-  }, [chapter]); // eslint-disable-line
+  }, [chapter]); // eslint-disable-line — intentionnellement limité à chapter
 
-  // Cleanup audio au unmount
-  useEffect(() => () => stopCurrent(), [stopCurrent]);
+  useEffect(() => () => stopAll(), [stopAll]);
 
   const sendMessage = async text => {
     const t = text.trim();
     if (!t || isLoading) return;
-    stopCurrent();
+    stopAll();
     appendMessage({ role: "user", type: "text", content: t });
     setInputText("");
     await callAI(t);
@@ -203,8 +217,8 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
       showToast(r.message);
     } catch { showToast(isCorrect ? "+20 XP ! 🎉" : "+5 XP 💪"); }
     const prompt = isCorrect
-      ? `${prenom || "Super"}, bonne réponse "${optionLabel}" ! Explique pourquoi pas-à-pas, puis propose un exercice plus difficile.`
-      : `Réponse "${optionLabel}" incorrecte${prenom ? ` ${prenom}` : ""}. Explique l'erreur gentiment, donne la bonne réponse pas-à-pas et encourage à continuer.`;
+      ? `${prenom ? prenom + ", b" : "B"}onne réponse "${optionLabel}" ! Explique pourquoi pas-à-pas, puis propose un exercice plus difficile.`
+      : `Réponse "${optionLabel}" incorrecte${prenom ? " " + prenom : ""}. Explique gentiment l'erreur, donne la correction pas-à-pas et encourage.`;
     await callAI(prompt);
   };
 
@@ -228,9 +242,10 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
       <div className="chat-messages" ref={chatRef}>
         {messages.map(msg => (
           <MessageBubble
-            key={msg.id} msg={msg}
+            key={msg.id}
+            msg={msg}
             onSelectOption={selectOption}
-            onSpeak={playMessage}
+            onSpeak={speakMessage}
             speakingId={speakingId}
           />
         ))}
@@ -247,7 +262,9 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
       </div>
 
       <div className="input-row">
-        {sttSupported && <VoiceButton listening={listening} onStart={startListening} onStop={stopListening} disabled={isLoading} />}
+        {sttSupported && (
+          <VoiceButton listening={listening} onStart={startListening} onStop={stopListening} disabled={isLoading} />
+        )}
         <input
           className={`chat-input ${listening ? "listening" : ""}`}
           value={listening ? "🎙 En écoute..." : inputText}
@@ -257,7 +274,8 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
           disabled={isLoading || listening}
           readOnly={listening}
         />
-        <button className="send-btn"
+        <button
+          className="send-btn"
           onClick={() => sendMessage(inputText)}
           disabled={isLoading || listening || !inputText.trim()}
         >↑</button>
@@ -272,23 +290,19 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
   );
 }
 
-// ── Parsing QCM ───────────────────────────────────────────────────────────────
 function parseExercise(content) {
-  const lines = content.split("\n").map(l => l.trim()).filter(Boolean);
-  // Accepte A. B. C. D. et A) B) C) D) et A- B- etc.
-  const reg = /^([ABCD])[.)•\-]\s+(.+)/i;
+  const lines   = content.split("\n").map(l => l.trim()).filter(Boolean);
+  const reg     = /^([ABCD])[.)•\-]\s+(.+)/i;
   const options = lines.filter(l => reg.test(l));
   if (options.length < 2) return null;
-  // Cherche la bonne réponse : "✓ Bonne réponse : X" ou "Réponse : X" ou ligne avec ✓
-  const correctLine = lines.find(l =>
+  const correctLine   = lines.find(l =>
     (l.includes("✓") && /[ABCD]/.test(l)) ||
-    /bonne\s+r[ée]ponse\s*:?\s*[ABCD]/i.test(l) ||
-    /r[ée]ponse\s+correcte\s*:?\s*[ABCD]/i.test(l)
+    /bonne\s+r[ée]ponse\s*:?\s*[ABCD]/i.test(l)
   );
   const correctLetter = correctLine?.match(/[ABCD]/i)?.[0]?.toUpperCase() ?? null;
   return {
     options: options.map(opt => {
-      const m = opt.match(reg);
+      const m      = opt.match(reg);
       const letter = m?.[1]?.toUpperCase() || opt[0].toUpperCase();
       return { label: opt, letter, text: m?.[2] || opt.slice(2).trim(), correct: correctLetter === letter };
     }),
@@ -297,21 +311,19 @@ function parseExercise(content) {
 
 function MessageBubble({ msg, onSelectOption, onSpeak, speakingId }) {
   const isSpeaking = speakingId === msg.id;
-  if (msg.role === "user") {
+  if (msg.role === "user")
     return <div className="msg-user"><div className="bubble-user">{msg.content}</div></div>;
-  }
+
   if (msg.type === "text") {
-    const exercise = !msg.answered ? parseExercise(msg.content) : null;
-    const optReg = /^[ABCD][.)•\-]\s+/i;
+    const exercise  = !msg.answered ? parseExercise(msg.content) : null;
+    const optReg    = /^[ABCD][.)•\-]\s+/i;
     const textLines = msg.content.split("\n").map(l => l.trim()).filter(l => {
       if (!l) return false;
       if (!exercise) return true;
-      // Masque les lignes d'options et la ligne "✓ Bonne réponse"
       if (optReg.test(l)) return false;
-      if (/bonne\s+r[ée]ponse|r[ée]ponse\s+(correcte|attendue)|✓/i.test(l)) return false;
+      if (/bonne\s+r[ée]ponse|✓/i.test(l)) return false;
       return true;
     });
-
     return (
       <div className="msg-bot">
         <div className="bubble-bot">
@@ -343,7 +355,7 @@ function MessageBubble({ msg, onSelectOption, onSpeak, speakingId }) {
 function TypingIndicator() {
   return (
     <div className="msg-bot">
-      <div className="bubble-bot typing-bubble">
+      <div className="bubble-bot">
         <div className="typing-indicator">
           <span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
           <span className="typing-text">MathBot réfléchit…</span>

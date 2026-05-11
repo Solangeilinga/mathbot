@@ -1,6 +1,6 @@
 // routes/subject.js
 const express = require("express");
-const router = express.Router();
+const router  = express.Router();
 const authMiddleware = require("../middlewares/auth");
 const {
   getSubject,
@@ -9,16 +9,22 @@ const {
   correctSubject,
 } = require("../controllers/subjectController");
 
-// GET /api/subject/sessions — Lister les sessions
+// GET /api/subject/sessions
 router.get("/sessions", listSessions);
 
-// GET /api/subject/:session — Lister les sujets d'une session
-router.get("/:session", listSubjectsBySession);
-
-// GET /api/subject/:session/:chapitre — Récupérer un sujet spécifique
-router.get("/:session/:chapitre", getSubject);
-
-// POST /api/subject/correct — Corriger un sujet avec l'IA (protégé)
+// POST /api/subject/correct
 router.post("/correct", authMiddleware, correctSubject);
+
+// GET /api/subject/:session/:chapitre  ← AVANT /:session obligatoirement
+router.get("/:session/:chapitre", authMiddleware, (req, res, next) => {
+  console.log(`[subject] GET session="${req.params.session}" chapitre="${req.params.chapitre}"`);
+  next();
+}, getSubject);
+
+// GET /api/subject/:session
+router.get("/:session", (req, res, next) => {
+  console.log(`[subject] GET session="${req.params.session}" (liste)`);
+  next();
+}, listSubjectsBySession);
 
 module.exports = router;
