@@ -12,6 +12,7 @@ const QUICK_ACTIONS = [
   { label: "🔁 Revoir les bases", text: "Je veux revoir les bases du chapitre depuis le début, étape par étape" },
 ];
 
+// ── Lecture audio base64 (ElevenLabs / Gemini) ────────────────────────────────
 function playAudioBase64(base64, mimeType, { onStart, onEnd } = {}) {
   try {
     const bytes = atob(base64);
@@ -31,6 +32,45 @@ function playAudioBase64(base64, mimeType, { onStart, onEnd } = {}) {
   }
 }
 
+// ── Lecture navigateur (fallback) ─────────────────────────────────────────────
+function speakBrowser(text, { onStart, onEnd } = {}) {
+  if (!window.speechSynthesis) { onEnd?.(); return null; }
+  window.speechSynthesis.cancel();
+
+  const clean = (text || "")
+    .replace(/[^\p{L}\p{N}\s.,!?;:'«»()\-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 700);
+
+  if (!clean) { onEnd?.(); return null; }
+
+  const utt = new SpeechSynthesisUtterance(clean);
+  utt.lang  = "fr-FR";
+  utt.rate  = 0.9;
+  utt.pitch = 1.05;
+
+  const applyVoice = () => {
+    const v = window.speechSynthesis.getVoices()
+      .find(v => v.lang === "fr-FR" && v.localService)
+      || window.speechSynthesis.getVoices().find(v => v.lang.startsWith("fr"))
+      || null;
+    if (v) utt.voice = v;
+  };
+
+  if (window.speechSynthesis.getVoices().length) {
+    applyVoice();
+  } else {
+    window.speechSynthesis.onvoiceschanged = applyVoice;
+  }
+
+  utt.onstart = onStart;
+  utt.onend   = onEnd;
+  utt.onerror = () => onEnd?.();
+  window.speechSynthesis.speak(utt);
+  return utt;
+}
+
 export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalkingChange }) {
   const [messages, setMessages]     = useState([]);
   const [inputText, setInputText]   = useState("");
@@ -39,15 +79,17 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
 
   const chatRef        = useRef(null);
   const initializedRef = useRef(false);
-  // Ref pour la lecture en cours — jamais périmé dans les callbacks
-  const playing = useRef(null); // { handle: Audio|null, msgId: number } | null
-  // Ref pour setTalking — stable
-  const onTalkingChangeRef = useRef(onTalkingChange);
-  useEffect(() => { onTalkingChangeRef.current = onTalkingChange; }, [onTalkingChange]);
+  // currentMsgId : le msgId pour lequel on est en train de parler (ou null)
+  const currentMsgId  = useRef(null);
+  // handle audio en cours (Audio ou SpeechSynthesisUtterance)
+  const audioHandle   = useRef(null);
+
+  const onTalkingRef = useRef(onTalkingChange);
+  useEffect(() => { onTalkingRef.current = onTalkingChange; }, [onTalkingChange]);
+
+  const setTalking = useCallback(val => onTalkingRef.current?.(val), []);
 
   const prenom = user?.prenom && user.prenom !== "undefined" ? user.prenom : "";
-
-  const setTalking = useCallback(val => onTalkingChangeRef.current?.(val), []);
 
   // Scroll auto
   useEffect(() => {
@@ -59,85 +101,99 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
     setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg }])
   , []);
 
-  // ── Stop propre ───────────────────────────────────────────────────────────
+  // ── Stoppe tout ───────────────────────────────────────────────────────────
   const stopAll = useCallback(() => {
-    if (playing.current?.handle) {
-      try { playing.current.handle.pause(); } catch {}
+    // Arrête audio IA
+    if (audioHandle.current instanceof Audio) {
+      try { audioHandle.current.pause(); } catch {}
     }
-    playing.current = null;
+    // Arrête voix navigateur
+    try { window.speechSynthesis?.cancel(); } catch {}
+    audioHandle.current = null;
+    currentMsgId.current = null;
     setSpeakingId(null);
     setTalking(false);
   }, [setTalking]);
 
-  // ── speakMessage — stable grâce aux refs ──────────────────────────────────
-  // On utilise une ref pour la fonction elle-même afin qu'elle soit accessible
-  // depuis callAI sans créer de dépendance circulaire
-  const speakMessageRef = useRef(null);
-
-  speakMessageRef.current = async (msgId, text) => {
-    // Toggle
-    if (playing.current?.msgId === msgId) {
+  // ── Fonction de lecture — appelée par ref pour éviter les closures périmées
+  const doSpeak = useCallback(async (msgId, text) => {
+    // Toggle : reclique = stop
+    if (currentMsgId.current === msgId) {
       stopAll();
       return;
     }
+
+    // Arrête le précédent sans attendre
     stopAll();
 
-    // Marque immédiatement
+    // Enregistre immédiatement le msgId courant
+    currentMsgId.current = msgId;
     setSpeakingId(msgId);
     setTalking(true);
 
+    const onEnd = () => {
+      // Vérifie que c'est bien ce message qui se termine
+      if (currentMsgId.current === msgId) {
+        currentMsgId.current = null;
+        audioHandle.current  = null;
+        setSpeakingId(null);
+        setTalking(false);
+      }
+    };
+
+    // ── Essai 1 : TTS IA (ElevenLabs / Gemini) ───────────────────────────
     try {
       const data = await ttsAPI.synthesize(text);
 
-      // Vérifie qu'on n'a pas été supplanté
-      // (si playing.current a changé, un autre message a pris le relais)
-      if (playing.current !== null) return;
-
-      const onEnd = () => {
-        // Vérifie que c'est bien ce message qui finit
-        if (playing.current?.msgId === msgId) {
-          playing.current = null;
-          setSpeakingId(null);
-          setTalking(false);
-        }
-      };
-
-      if (data.silent) {
-        // Pas de voix disponible
-        playing.current = null;
-        setSpeakingId(null);
-        setTalking(false);
-        return;
-      }
+      // Vérifie qu'on n'a pas été supplanté pendant l'attente réseau
+      if (currentMsgId.current !== msgId) return;
 
       if (data.audioContent) {
         const audio = playAudioBase64(data.audioContent, data.mimeType, {
-          onStart: () => { setSpeakingId(msgId); setTalking(true); },
+          onStart: () => {
+            if (currentMsgId.current === msgId) {
+              setSpeakingId(msgId);
+              setTalking(true);
+            }
+          },
           onEnd,
         });
         if (audio) {
-          playing.current = { handle: audio, msgId };
-        } else {
-          playing.current = null;
-          setSpeakingId(null);
-          setTalking(false);
+          audioHandle.current = audio;
+          return; // succès
         }
-      } else {
-        playing.current = null;
-        setSpeakingId(null);
-        setTalking(false);
       }
     } catch {
-      playing.current = null;
+      // TTS IA indisponible → on continue vers le navigateur
+    }
+
+    // Vérifie encore qu'on n'a pas été supplanté
+    if (currentMsgId.current !== msgId) return;
+
+    // ── Essai 2 : voix navigateur ─────────────────────────────────────────
+    const utt = speakBrowser(text, {
+      onStart: () => {
+        if (currentMsgId.current === msgId) {
+          setSpeakingId(msgId);
+          setTalking(true);
+        }
+      },
+      onEnd,
+    });
+
+    if (utt) {
+      audioHandle.current = utt;
+    } else {
+      // Aucune voix disponible
+      currentMsgId.current = null;
       setSpeakingId(null);
       setTalking(false);
     }
-  };
+  }, [stopAll, setTalking]);
 
-  // Wrapper stable exposé aux composants
-  const speakMessage = useCallback((msgId, text) => {
-    speakMessageRef.current(msgId, text);
-  }, []);
+  // Ref stable pour doSpeak (accessible depuis callAI sans dépendance circulaire)
+  const doSpeakRef = useRef(doSpeak);
+  useEffect(() => { doSpeakRef.current = doSpeak; }, [doSpeak]);
 
   // ── Appel IA ──────────────────────────────────────────────────────────────
   const callAI = useCallback(async (text) => {
@@ -146,10 +202,9 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
       const data = await chatAPI.sendMessage(text, chapter);
       setIsLoading(false);
       const msgId = Date.now();
-      // 1. Affiche le texte immédiatement
       appendMessage({ id: msgId, role: "bot", type: "text", content: data.reply });
-      // 2. Lance la voix automatiquement
-      speakMessageRef.current(msgId, data.reply);
+      // Lance la voix automatiquement via la ref (toujours à jour)
+      doSpeakRef.current(msgId, data.reply);
     } catch (err) {
       setIsLoading(false);
       let msg = "⚠️ MathBot ne peut pas répondre pour le moment";
@@ -159,7 +214,7 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
     }
   }, [chapter, appendMessage]);
 
-  // ── Voix entrée ───────────────────────────────────────────────────────────
+  // ── Voix entrée micro ─────────────────────────────────────────────────────
   const onVoiceResult = useCallback(transcript => {
     appendMessage({ role: "user", type: "text", content: transcript });
     callAI(transcript);
@@ -172,7 +227,7 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
   const { listening, start: startListening, stop: stopListening, supported: sttSupported } =
     useSpeechRecognition({ onResult: onVoiceResult, onError: onVoiceError });
 
-  // ── Bienvenue — s'exécute une seule fois par chapitre ─────────────────────
+  // ── Message de bienvenue ──────────────────────────────────────────────────
   useEffect(() => {
     if (initializedRef.current) return;
     initializedRef.current = true;
@@ -185,8 +240,7 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
         setIsLoading(false);
         const msgId = Date.now();
         appendMessage({ id: msgId, role: "bot", type: "text", content: data.reply });
-        // Voix auto sur le message de bienvenue
-        speakMessageRef.current(msgId, data.reply);
+        doSpeakRef.current(msgId, data.reply);
       } catch {
         setIsLoading(false);
         const fallback = prenom
@@ -195,10 +249,11 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
         appendMessage({ role: "bot", type: "text", content: fallback });
       }
     })();
-  }, [chapter]); // eslint-disable-line — intentionnellement limité à chapter
+  }, [chapter]); // eslint-disable-line
 
   useEffect(() => () => stopAll(), [stopAll]);
 
+  // ── Envoi message ─────────────────────────────────────────────────────────
   const sendMessage = async text => {
     const t = text.trim();
     if (!t || isLoading) return;
@@ -208,6 +263,7 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
     await callAI(t);
   };
 
+  // ── Réponse QCM ──────────────────────────────────────────────────────────
   const selectOption = async (msgId, optionLabel, isCorrect) => {
     setMessages(prev => prev.map(m => m.id === msgId ? { ...m, answered: true } : m));
     appendMessage({ role: "user", type: "text", content: `Ma réponse : ${optionLabel}` });
@@ -225,6 +281,11 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
   const handleKey = e => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(inputText); }
   };
+
+  // Wrapper stable pour les composants enfants
+  const speakMessage = useCallback((msgId, text) => {
+    doSpeakRef.current(msgId, text);
+  }, []);
 
   return (
     <div className="chat-area">
@@ -263,7 +324,12 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
 
       <div className="input-row">
         {sttSupported && (
-          <VoiceButton listening={listening} onStart={startListening} onStop={stopListening} disabled={isLoading} />
+          <VoiceButton
+            listening={listening}
+            onStart={startListening}
+            onStop={stopListening}
+            disabled={isLoading}
+          />
         )}
         <input
           className={`chat-input ${listening ? "listening" : ""}`}
@@ -290,6 +356,7 @@ export default function ChatArea({ chapter, onXPUpdate, showToast, user, onTalki
   );
 }
 
+// ── Parse QCM ─────────────────────────────────────────────────────────────────
 function parseExercise(content) {
   const lines   = content.split("\n").map(l => l.trim()).filter(Boolean);
   const reg     = /^([ABCD])[.)•\-]\s+(.+)/i;
@@ -304,7 +371,12 @@ function parseExercise(content) {
     options: options.map(opt => {
       const m      = opt.match(reg);
       const letter = m?.[1]?.toUpperCase() || opt[0].toUpperCase();
-      return { label: opt, letter, text: m?.[2] || opt.slice(2).trim(), correct: correctLetter === letter };
+      return {
+        label:   opt,
+        letter,
+        text:    m?.[2] || opt.slice(2).trim(),
+        correct: correctLetter === letter,
+      };
     }),
   };
 }
@@ -357,7 +429,9 @@ function TypingIndicator() {
     <div className="msg-bot">
       <div className="bubble-bot">
         <div className="typing-indicator">
-          <span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
+          <span className="typing-dot" />
+          <span className="typing-dot" />
+          <span className="typing-dot" />
           <span className="typing-text">MathBot réfléchit…</span>
         </div>
       </div>
